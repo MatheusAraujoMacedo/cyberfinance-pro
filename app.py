@@ -85,12 +85,19 @@ def init_db():
         c.execute('CREATE TABLE IF NOT EXISTS movimentacoes (id INTEGER PRIMARY KEY AUTOINCREMENT, data DATE, categoria TEXT, descricao TEXT, valor REAL, tipo TEXT)')
         c.execute('CREATE TABLE IF NOT EXISTS logs_auditoria (id INTEGER PRIMARY KEY AUTOINCREMENT, data_hora TEXT, acao TEXT, usuario TEXT)')
         c.execute('CREATE TABLE IF NOT EXISTS metas (categoria TEXT PRIMARY KEY, valor_limite REAL)')
+        c.execute('CREATE TABLE IF NOT EXISTS usuarios (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, criado_em TEXT)')
         
         # Inicializa metas zeradas se não existirem
         c.execute("SELECT COUNT(*) FROM metas")
         if c.fetchone()[0] == 0:
             for cat in LISTA_CATEGORIAS:
                 c.execute("INSERT INTO metas (categoria, valor_limite) VALUES (?, ?)", (cat, 0.0))
+        # Garante usuário admin padrão no banco
+        c.execute("SELECT COUNT(*) FROM usuarios WHERE username = ?", (USUARIO_PADRAO,))
+        if c.fetchone()[0] == 0:
+            hash_admin = bcrypt.hashpw(SENHA_PADRAO_TEXTO.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+            c.execute("INSERT INTO usuarios (username, password_hash, criado_em) VALUES (?,?,?)",
+                      (USUARIO_PADRAO, hash_admin, datetime.now().strftime("%Y-%m-%d %H:%M")))
         conn.commit()
 
 def run_query(q, p=()):
@@ -100,6 +107,18 @@ def run_query(q, p=()):
 def get_data(q):
     with sqlite3.connect(DB_FILE) as conn:
         return pd.read_sql(q, conn)
+
+def get_user_hash(username):
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("SELECT password_hash FROM usuarios WHERE username = ?", (username,))
+        row = c.fetchone()
+        return row[0] if row else None
+
+def create_user(username, password):
+    senha_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    run_query("INSERT INTO usuarios (username, password_hash, criado_em) VALUES (?,?,?)",
+              (username, senha_hash, datetime.now().strftime("%Y-%m-%d %H:%M")))
 
 # --- 3. FUNCIONALIDADES AUXILIARES ---
 class PDFRelatorio(FPDF):
@@ -149,36 +168,56 @@ if not st.session_state['logado']:
     with col:
         st.write("")
         st.markdown("<h1 style='text-align:center;'>🚀 Cyber Login</h1>", unsafe_allow_html=True)
-        u = st.text_input("Usuário")
-        p = st.text_input("Chave de Acesso", type="password")
-        
-        if st.button("AUTENTICAR"):
-            # Lógica Híbrida: Aceita a senha "1234" OU validação de Hash
-            # Isso garante que você não fique trancado fora
-            senha_correta = False
-            
-            if u == USUARIO_PADRAO:
-                if p == SENHA_PADRAO_TEXTO:
-                    senha_correta = True
-                else:
-                    # Tenta validar via Hash (Simulação de Produção)
+        tab_login, tab_cadastro = st.tabs(["Login", "Cadastrar"])
+
+        with tab_login:
+            u = st.text_input("Usuário", key="login_user")
+            p = st.text_input("Chave de Acesso", type="password", key="login_pass")
+
+            if st.button("AUTENTICAR"):
+                senha_correta = False
+
+                # 1) Validação por usuário cadastrado
+                hash_salvo = get_user_hash(u)
+                if hash_salvo:
                     try:
-                        # Este hash é um exemplo. No modo dev, a senha texto funciona.
-                        hash_exemplo = b'$2b$12$K69E.fI.N9hYv0.y3mBfO.H/D/M8vS/h5zP3R6Y9A7B8C9D1E2F3G'
-                        if bcrypt.checkpw(p.encode('utf-8'), hash_exemplo):
+                        if bcrypt.checkpw(p.encode('utf-8'), hash_salvo.encode('utf-8')):
                             senha_correta = True
                     except:
-                        pass # Falha silenciosa no hash, confia na senha texto
+                        pass
 
-            if senha_correta:
-                with st.spinner("Descriptografando acesso..."):
-                    time.sleep(0.8)
-                st.session_state['logado'] = True
-                run_query("INSERT INTO logs_auditoria (data_hora, acao, usuario) VALUES (?,?,?)", 
-                          (datetime.now().strftime("%Y-%m-%d %H:%M"), "Login Realizado", u))
-                st.rerun()
-            else:
-                st.error("ACESSO NEGADO: Credenciais Inválidas")
+                # 2) Fallback do admin (senha texto) para não travar acesso
+                if not senha_correta and u == USUARIO_PADRAO and p == SENHA_PADRAO_TEXTO:
+                    senha_correta = True
+
+                if senha_correta:
+                    with st.spinner("Descriptografando acesso..."):
+                        time.sleep(0.8)
+                    st.session_state['logado'] = True
+                    run_query("INSERT INTO logs_auditoria (data_hora, acao, usuario) VALUES (?,?,?)", 
+                              (datetime.now().strftime("%Y-%m-%d %H:%M"), "Login Realizado", u))
+                    st.rerun()
+                else:
+                    st.error("ACESSO NEGADO: Credenciais Inválidas")
+
+        with tab_cadastro:
+            nu = st.text_input("Novo usuário", key="cad_user")
+            np = st.text_input("Senha", type="password", key="cad_pass")
+            nc = st.text_input("Confirmar senha", type="password", key="cad_conf")
+
+            if st.button("CRIAR CONTA"):
+                if not nu or not np:
+                    st.warning("Preencha usuário e senha.")
+                elif np != nc:
+                    st.warning("As senhas não conferem.")
+                else:
+                    try:
+                        create_user(nu, np)
+                        run_query("INSERT INTO logs_auditoria (data_hora, acao, usuario) VALUES (?,?,?)",
+                                  (datetime.now().strftime("%Y-%m-%d %H:%M"), "Usuário Criado", nu))
+                        st.success("Usuário criado com sucesso. Faça login.")
+                    except sqlite3.IntegrityError:
+                        st.error("Usuário já existe. Escolha outro.")
     st.stop()
 
 # --- 5. SIDEBAR (MENU LATERAL) ---
