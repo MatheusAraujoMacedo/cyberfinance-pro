@@ -85,9 +85,10 @@ def init_db():
         c.execute('CREATE TABLE IF NOT EXISTS movimentacoes (id INTEGER PRIMARY KEY AUTOINCREMENT, data DATE, categoria TEXT, descricao TEXT, valor REAL, tipo TEXT)')
         c.execute('CREATE TABLE IF NOT EXISTS logs_auditoria (id INTEGER PRIMARY KEY AUTOINCREMENT, data_hora TEXT, acao TEXT, usuario TEXT)')
         c.execute('CREATE TABLE IF NOT EXISTS metas (categoria TEXT PRIMARY KEY, valor_limite REAL)')
+        c.execute('CREATE TABLE IF NOT EXISTS metas_usuario (categoria TEXT NOT NULL, usuario TEXT NOT NULL, valor_limite REAL, PRIMARY KEY (categoria, usuario))')
         c.execute('CREATE TABLE IF NOT EXISTS usuarios (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, criado_em TEXT)')
         
-        # Inicializa metas zeradas se não existirem
+        # Inicializa metas zeradas se não existirem (legado)
         c.execute("SELECT COUNT(*) FROM metas")
         if c.fetchone()[0] == 0:
             for cat in LISTA_CATEGORIAS:
@@ -108,6 +109,35 @@ def get_data(q):
     with sqlite3.connect(DB_FILE) as conn:
         return pd.read_sql(q, conn)
 
+def ensure_schema_per_user():
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+
+        # movimentacoes: adiciona coluna usuario se não existir
+        cols_mov = [r[1] for r in c.execute("PRAGMA table_info(movimentacoes)").fetchall()]
+        if "usuario" not in cols_mov:
+            c.execute("ALTER TABLE movimentacoes ADD COLUMN usuario TEXT")
+            c.execute("UPDATE movimentacoes SET usuario = ? WHERE usuario IS NULL", (USUARIO_PADRAO,))
+
+        # metas_usuario: cria se não existir e migra metas legadas
+        c.execute('CREATE TABLE IF NOT EXISTS metas_usuario (categoria TEXT NOT NULL, usuario TEXT NOT NULL, valor_limite REAL, PRIMARY KEY (categoria, usuario))')
+        c.execute("SELECT COUNT(*) FROM metas_usuario")
+        if c.fetchone()[0] == 0:
+            # migra metas legadas para admin
+            for cat, val in c.execute("SELECT categoria, valor_limite FROM metas").fetchall():
+                c.execute("INSERT OR REPLACE INTO metas_usuario (categoria, usuario, valor_limite) VALUES (?, ?, ?)", (cat, USUARIO_PADRAO, val))
+
+        conn.commit()
+
+def seed_metas_usuario(usuario):
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        for cat in LISTA_CATEGORIAS:
+            c.execute("SELECT COUNT(*) FROM metas_usuario WHERE categoria = ? AND usuario = ?", (cat, usuario))
+            if c.fetchone()[0] == 0:
+                c.execute("INSERT INTO metas_usuario (categoria, usuario, valor_limite) VALUES (?, ?, ?)", (cat, usuario, 0.0))
+        conn.commit()
+
 def ensure_users_table():
     try:
         with sqlite3.connect(DB_FILE) as conn:
@@ -126,9 +156,11 @@ def get_user_hash(username):
 
 def create_user(username, password):
     ensure_users_table()
+    ensure_schema_per_user()
     senha_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     run_query("INSERT INTO usuarios (username, password_hash, criado_em) VALUES (?,?,?)",
               (username, senha_hash, datetime.now().strftime("%Y-%m-%d %H:%M")))
+    seed_metas_usuario(username)
 
 # --- 3. FUNCIONALIDADES AUXILIARES ---
 class PDFRelatorio(FPDF):
@@ -168,6 +200,7 @@ def classificar_ia(desc):
 
 # --- INICIALIZAÇÃO ---
 init_db()
+ensure_schema_per_user()
 aplicar_ui_cyber()
 
 # --- 4. LOGIN (COM HASHING & FALLBACK) ---
@@ -206,6 +239,8 @@ if not st.session_state['logado']:
                     with st.spinner("Descriptografando acesso..."):
                         time.sleep(0.8)
                     st.session_state['logado'] = True
+                    st.session_state['usuario'] = u
+                    seed_metas_usuario(u)
                     run_query("INSERT INTO logs_auditoria (data_hora, acao, usuario) VALUES (?,?,?)", 
                               (datetime.now().strftime("%Y-%m-%d %H:%M"), "Login Realizado", u))
                     st.rerun()
@@ -240,9 +275,11 @@ if not st.session_state['logado']:
 
 # --- 5. SIDEBAR (MENU LATERAL) ---
 with st.sidebar:
-    st.markdown(f"### 👤 ADMIN: {USUARIO_PADRAO.upper()}")
+    usuario_atual = st.session_state.get('usuario', USUARIO_PADRAO)
+    st.markdown(f"### 👤 USUÁRIO: {usuario_atual.upper()}")
     if st.button("🔒 Encerrar Sessão"): 
         st.session_state['logado'] = False
+        st.session_state.pop('usuario', None)
         st.rerun()
     st.divider()
 
@@ -262,8 +299,8 @@ with st.sidebar:
                     d_p = dt + relativedelta(months=i)
                     valor_parc = val / par
                     desc_final = f"{dsc} ({i+1}/{par})" if par > 1 else dsc
-                    run_query("INSERT INTO movimentacoes (data, categoria, descricao, valor, tipo) VALUES (?,?,?,?,?)", 
-                              (d_p, cat_f, desc_final, valor_parc, "Despesa"))
+                    run_query("INSERT INTO movimentacoes (data, categoria, descricao, valor, tipo, usuario) VALUES (?,?,?,?,?,?)", 
+                              (d_p, cat_f, desc_final, valor_parc, "Despesa", usuario_atual))
                 st.success("Despesa Gravada!")
                 time.sleep(0.5)
                 st.rerun()
@@ -274,8 +311,8 @@ with st.sidebar:
             rs = st.text_input("Fonte")
             rv = st.number_input("Valor", min_value=0.0, step=0.01, key="rv")
             if st.form_submit_button("Salvar Receita"):
-                run_query("INSERT INTO movimentacoes (data, categoria, descricao, valor, tipo) VALUES (?,?,?,?,?)", 
-                          (rd, "Receita", rs, rv, "Receita"))
+                run_query("INSERT INTO movimentacoes (data, categoria, descricao, valor, tipo, usuario) VALUES (?,?,?,?,?,?)", 
+                          (rd, "Receita", rs, rv, "Receita", usuario_atual))
                 st.rerun()
 
     with t_csv:
@@ -286,8 +323,8 @@ with st.sidebar:
                 count = 0
                 for _, r in df_c.iterrows():
                     # Adapte as colunas conforme seu CSV
-                    run_query("INSERT INTO movimentacoes (data, categoria, descricao, valor, tipo) VALUES (?,?,?,?,?)", 
-                              (r.get('Data', datetime.now()), r.get('Categoria', 'Outros'), r.get('Descricao','Importado CSV'), r.get('Valor', 0), r.get('Tipo','Despesa')))
+                    run_query("INSERT INTO movimentacoes (data, categoria, descricao, valor, tipo, usuario) VALUES (?,?,?,?,?,?)", 
+                              (r.get('Data', datetime.now()), r.get('Categoria', 'Outros'), r.get('Descricao','Importado CSV'), r.get('Valor', 0), r.get('Tipo','Despesa'), usuario_atual))
                     count += 1
                 st.success(f"{count} registros importados!")
             except Exception as e:
@@ -309,8 +346,9 @@ with st.sidebar:
             st.warning("Sem conexão com a API de moedas.")
 
 # --- 6. PAINEL CENTRAL (DASHBOARD) ---
-df = get_data("SELECT * FROM movimentacoes")
-metas_df = get_data("SELECT * FROM metas")
+usuario_atual = st.session_state.get('usuario', USUARIO_PADRAO)
+df = get_data(f"SELECT * FROM movimentacoes WHERE usuario = '{usuario_atual}'")
+metas_df = get_data(f"SELECT * FROM metas_usuario WHERE usuario = '{usuario_atual}'")
 
 col_t, col_p = st.columns([4,1])
 col_t.title("📊 Terminal CyberFinance")
@@ -386,7 +424,7 @@ with tab_busca:
     
     if termo_busca:
         # Busca segura usando parâmetros SQL
-        q_busca = f"SELECT * FROM movimentacoes WHERE descricao LIKE '%{termo_busca}%' OR categoria LIKE '%{termo_busca}%'"
+        q_busca = f"SELECT * FROM movimentacoes WHERE usuario = '{usuario_atual}' AND (descricao LIKE '%{termo_busca}%' OR categoria LIKE '%{termo_busca}%')"
         res_busca = get_data(q_busca)
         
         if not res_busca.empty:
@@ -407,7 +445,7 @@ with tab_metas:
         
         if st.form_submit_button("Salvar Todas as Metas"):
             for cat, val in novas_metas.items():
-                run_query("INSERT OR REPLACE INTO metas (categoria, valor_limite) VALUES (?, ?)", (cat, val))
+                run_query("INSERT OR REPLACE INTO metas_usuario (categoria, usuario, valor_limite) VALUES (?, ?, ?)", (cat, usuario_atual, val))
             st.success("Metas Atualizadas!")
             time.sleep(0.5)
             st.rerun()
@@ -420,7 +458,7 @@ with tab_metas:
         cols_prog = st.columns(3)
         for i, cat in enumerate(LISTA_CATEGORIAS):
             # Pega o limite
-            limite_res = get_data(f"SELECT valor_limite FROM metas WHERE categoria='{cat}'")
+            limite_res = get_data(f"SELECT valor_limite FROM metas_usuario WHERE categoria='{cat}' AND usuario = '{usuario_atual}'")
             limite = limite_res.values[0][0] if not limite_res.empty else 0.0
             
             # Pega o gasto atual
@@ -483,5 +521,27 @@ with tab_previsao:
 with tab_aud:
     st.subheader("🛡️ Auditoria de Sistema (Logs)")
     st.caption("Rastreamento de segurança para conformidade.")
-    logs = get_data("SELECT * FROM logs_auditoria ORDER BY id DESC")
+    col_f1, col_f2, col_f3 = st.columns(3)
+    data_ini = col_f1.date_input("Data inicial", value=(datetime.now() - relativedelta(days=30)).date())
+    data_fim = col_f2.date_input("Data final", value=datetime.now().date())
+    acoes_logs = get_data("SELECT DISTINCT acao FROM logs_auditoria ORDER BY acao")["acao"].tolist()
+    filtro_acao = col_f3.selectbox("Tipo de ação", ["Todas"] + acoes_logs)
+
+    if usuario_atual == USUARIO_PADRAO:
+        usuarios_logs = get_data("SELECT DISTINCT usuario FROM logs_auditoria ORDER BY usuario")["usuario"].tolist()
+        opcoes = ["Todos"] + usuarios_logs
+        filtro_user = st.selectbox("Filtrar por usuário", opcoes)
+    else:
+        filtro_user = usuario_atual
+
+    where = []
+    if filtro_user != "Todos":
+        where.append(f"usuario = '{filtro_user}'")
+    if filtro_acao != "Todas":
+        where.append(f"acao = '{filtro_acao}'")
+    if data_ini and data_fim:
+        where.append(f"date(data_hora) BETWEEN '{data_ini}' AND '{data_fim}'")
+
+    where_sql = " WHERE " + " AND ".join(where) if where else ""
+    logs = get_data(f"SELECT * FROM logs_auditoria{where_sql} ORDER BY id DESC")
     st.dataframe(logs, use_container_width=True)
