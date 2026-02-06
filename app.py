@@ -108,7 +108,16 @@ def get_data(q):
     with sqlite3.connect(DB_FILE) as conn:
         return pd.read_sql(q, conn)
 
+def ensure_users_table():
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("SELECT 1 FROM usuarios LIMIT 1")
+    except sqlite3.OperationalError:
+        # Cria a tabela caso o banco tenha sido gerado antes da migração
+        init_db()
+
 def get_user_hash(username):
+    ensure_users_table()
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
         c.execute("SELECT password_hash FROM usuarios WHERE username = ?", (username,))
@@ -116,6 +125,7 @@ def get_user_hash(username):
         return row[0] if row else None
 
 def create_user(username, password):
+    ensure_users_table()
     senha_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     run_query("INSERT INTO usuarios (username, password_hash, criado_em) VALUES (?,?,?)",
               (username, senha_hash, datetime.now().strftime("%Y-%m-%d %H:%M")))
@@ -185,6 +195,8 @@ if not st.session_state['logado']:
                             senha_correta = True
                     except:
                         pass
+                elif u:
+                    st.info("Usuário não encontrado. Use a aba Cadastrar.")
 
                 # 2) Fallback do admin (senha texto) para não travar acesso
                 if not senha_correta and u == USUARIO_PADRAO and p == SENHA_PADRAO_TEXTO:
