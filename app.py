@@ -227,9 +227,15 @@ if not st.session_state['logado']:
                         create_user(nu, np)
                         run_query("INSERT INTO logs_auditoria (data_hora, acao, usuario) VALUES (?,?,?)",
                                   (datetime.now().strftime("%Y-%m-%d %H:%M"), "Usuário Criado", nu))
-                        st.success("Usuário criado com sucesso. Faça login.")
+                        # Confirma se o usuário ficou persistido
+                        if get_user_hash(nu):
+                            st.success("Usuário criado com sucesso. Faça login.")
+                        else:
+                            st.error("Falha ao persistir o usuário. Verifique permissões do banco.")
                     except sqlite3.IntegrityError:
                         st.error("Usuário já existe. Escolha outro.")
+                    except Exception as e:
+                        st.error(f"Erro ao criar usuário: {e}")
     st.stop()
 
 # --- 5. SIDEBAR (MENU LATERAL) ---
