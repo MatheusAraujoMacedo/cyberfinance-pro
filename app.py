@@ -8,6 +8,7 @@ from dateutil.relativedelta import relativedelta
 import time
 from fpdf import FPDF
 import bcrypt
+import os
 
 # --- 1. CONFIGURAÇÃO E ESTILO PREMIUM ---
 st.set_page_config(page_title="CyberFinance Pro", page_icon="💎", layout="wide")
@@ -74,7 +75,15 @@ def aplicar_ui_cyber():
     """, unsafe_allow_html=True)
 
 # --- 2. CORE: BANCO DE DADOS ---
-DB_FILE = 'financeiro.db'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR_OK = True
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    DATA_DIR_OK = False
+
+DB_FILE = os.path.join(DATA_DIR, "financeiro.db") if DATA_DIR_OK else os.path.join(BASE_DIR, "financeiro.db")
 USUARIO_PADRAO = "admin"
 SENHA_PADRAO_TEXTO = "1234" # Senha para comparação de fallback
 LISTA_CATEGORIAS = ["Alimentação", "Transporte", "Lazer", "Educação", "Hardware", "Contas Fixas", "Outros"]
